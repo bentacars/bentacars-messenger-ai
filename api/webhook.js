@@ -75,7 +75,7 @@ function looksLikeUsedCarIntent(t) {
 
 async function runWorkflowV2(userText) {
   // Workflows v2: SAME /v1 path, but MUST send header OpenAI-Beta: workflows=v2
-  const url = `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`;
+  const url = `https://api.openai.com/v2/workflows/${WORKFLOW_ID}/runs`;
 
   const body = {
     // match your workflow’s input name
