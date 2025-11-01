@@ -1,122 +1,174 @@
 // /api/webhook.js
-// ✅ Full working webhook for Facebook Messenger + OpenAI Workflows
-// Requires the following ENV variables configured in Vercel:
-// - OPENAI_API_KEY
-// - OPENAI_PROJECT
-// - WORKFLOW_ID
-// - PAGE_ACCESS_TOKEN
-// - META_VERIFY_TOKEN
+// Vercel Node runtime (NOT Edge). Uses native fetch in Node 18+
 
 export default async function handler(req, res) {
-  const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
   const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-  const WORKFLOW_ID = process.env.WORKFLOW_ID;
+  const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
   const OPENAI_PROJECT = process.env.OPENAI_PROJECT;
+  const WORKFLOW_ID = process.env.WORKFLOW_ID;
 
-  if (!PAGE_ACCESS_TOKEN || !VERIFY_TOKEN || !WORKFLOW_ID || !OPENAI_API_KEY || !OPENAI_PROJECT) {
-    console.error("❌ Missing required environment variables");
-    return res.status(500).send("Server Misconfigured: Missing ENV");
-  }
+  // --- Small helpers --------------------------------------------------------
+  const ok = (data) => res.status(200).json(data ?? { ok: true });
+  const bad = (code, msg) => res.status(code).json({ error: String(msg) });
 
-  // 🔍 GET Request: Facebook webhook verification
+  const sendTyping = async (recipientId) => {
+    try {
+      await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: recipientId },
+          sender_action: "typing_on",
+        }),
+      });
+    } catch (e) {
+      console.error("Typing indicator failed:", e);
+    }
+  };
+
+  const sendText = async (recipientId, text) => {
+    try {
+      const r = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: recipientId },
+          message: { text },
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      console.log("📤 SEND RESULT:", j);
+    } catch (e) {
+      console.error("❌ Send message error:", e);
+    }
+  };
+
+  const politeFail = async (recipientId) =>
+    sendText(
+      recipientId,
+      "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏"
+    );
+
+  // --- 1) Webhook VERIFY (GET) ----------------------------------------------
   if (req.method === "GET") {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("✅ Webhook verified successfully");
-      return res.status(200).send(challenge);
-    } else {
-      console.warn("❌ Webhook verification failed");
-      return res.status(403).send("Verification failed");
+      console.log("✅ Webhook verified!");
+      res.status(200).send(challenge);
+      return;
     }
+    return bad(403, "Verification failed");
   }
 
-  // 📩 POST Request: Facebook sends user messages here
+  // --- 2) Incoming events (POST) --------------------------------------------
   if (req.method === "POST") {
     try {
-      const body = req.body;
-
-      if (body.object !== "page") return res.status(200).send("Not a page event");
-
-      const messagingEvent = body.entry?.[0]?.messaging?.[0];
-      const senderId = messagingEvent?.sender?.id;
-      const incomingText = messagingEvent?.message?.text;
-
-      if (!senderId || !incomingText) {
-        console.error("⚠️ Missing sender or text in FB webhook");
-        return res.status(200).send("No actionable message");
+      const body = req.body || {};
+      // Facebook Messenger delivers {object:'page', entry:[{ messaging: [...] }]}
+      if (body.object !== "page" || !Array.isArray(body.entry)) {
+        // Allow local curl tests that send plain {message:"hi"} shape
+        console.log("ℹ️ Non-standard payload (likely test):", JSON.stringify(body));
+        return ok({ received: true });
       }
 
-      console.log("📥 Incoming message:", { senderId, incomingText });
+      for (const entry of body.entry) {
+        const messagingEvents = entry.messaging || [];
+        for (const event of messagingEvents) {
+          const senderId = event?.sender?.id;
+          const text =
+            event?.message?.text ??
+            event?.postback?.title ??
+            event?.postback?.payload ??
+            "";
 
-      // 🚀 CALL YOUR OPENAI WORKFLOW
-      const oaResponse = await fetch(`https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "OpenAI-Project": OPENAI_PROJECT
-        },
-        body: JSON.stringify({
-          model: "gpt-4.1",            // ALWAYS required when invoking workflows
-          input: { input_as_text: incomingText }
-        })
-      });
+          if (!senderId) continue;
 
-      const rawResponse = await oaResponse.text();
-      let parsedResponse;
+          // Skip if nothing to process
+          if (!text || typeof text !== "string") {
+            await politeFail(senderId);
+            continue;
+          }
 
-      try {
-        parsedResponse = JSON.parse(rawResponse);
-      } catch (err) {
-        console.error("❌ OpenAI returned non-JSON:\n", rawResponse);
-        throw new Error("OpenAI response was not JSON");
-      }
+          console.log("📥 Incoming:", { senderId, text });
 
-      if (!oaResponse.ok) {
-        console.error("❌ OpenAI returned error:", parsedResponse);
-        throw new Error(parsedResponse?.error?.message || "OpenAI workflow failed");
-      }
+          // Send typing indicator
+          await sendTyping(senderId);
 
-      console.log("🤖 OpenAI Workflow Output:", parsedResponse);
+          // --- Call OpenAI Workflows (CORRECT, ABSOLUTE URL) -----------------
+          const oaResponse = await fetch(
+            `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/json",
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                "OpenAI-Project": OPENAI_PROJECT,
+              },
+              body: JSON.stringify({
+                // Your workflow expects { input_as_text: "..." }
+                input: { input_as_text: text },
+                // Some workflows also accept model; harmless to include.
+                model: "gpt-4.1",
+              }),
+            }
+          );
 
-      const replyText =
-        parsedResponse?.output_text ||
-        parsedResponse?.run?.output_text ||
-        parsedResponse?.result?.output_text ||
-        "Medyo nagka-issue sa processing. Can you try again? 🙏";
+          // If OpenAI returns HTML (e.g., wrong URL), avoid JSON.parse crash
+          const raw = await oaResponse.text();
+          let wf;
+          try {
+            wf = JSON.parse(raw);
+          } catch (e) {
+            console.error("❌ Webhook error: OpenAI returned non-JSON:", raw.slice(0, 200));
+            await politeFail(senderId);
+            continue;
+          }
 
-      // 📤 Send message back to user in Messenger
-      const fbSendResult = await fetch(
-        `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipient: { id: senderId },
-            message: { text: replyText }
-          })
+          if (!oaResponse.ok) {
+            console.error("❌ OpenAI returned error:", wf);
+            await politeFail(senderId);
+            continue;
+          }
+
+          // --- Extract the workflow's reply text safely ----------------------
+          // Your Agent Builder workflow returns an object shaped like either:
+          //  A) { output_text: "..." }
+          //  B) { result: { output_text: "..." } }
+          //  C) { output: { text: "..." } }
+          //  D) fallback to something inside arrays if present
+          const replyText =
+            wf?.output_text ||
+            wf?.result?.output_text ||
+            wf?.output?.text ||
+            wf?.data?.[0]?.content?.[0]?.text?.value ||
+            wf?.message ||
+            null;
+
+          console.log("🤖 Workflow output (raw):", JSON.stringify(wf).slice(0, 500));
+          console.log("📝 Resolved reply text:", replyText);
+
+          if (!replyText || typeof replyText !== "string") {
+            await politeFail(senderId);
+            continue;
+          }
+
+          // --- Send back to Messenger ---------------------------------------
+          await sendText(senderId, replyText);
         }
-      );
-
-      if (!fbSendResult.ok) {
-        const fbErr = await fbSendResult.text();
-        console.error("❌ FB send failed:", fbErr);
-      } else {
-        console.log("✅ Message sent to user:", replyText);
       }
 
-      return res.status(200).send("ok");
-    } catch (error) {
-      console.error("❌ Webhook error:", error);
-      return res.status(500).json({ error: error.message || error.toString() });
+      return ok({ delivered: true });
+    } catch (err) {
+      console.error("❌ Unhandled webhook error:", err);
+      return bad(500, "Server error");
     }
   }
 
-  // ❌ Invalid request method
-  return res.status(405).send("Method Not Allowed");
+  // --- Others ---------------------------------------------------------------
+  return bad(404, "Not Found");
 }
