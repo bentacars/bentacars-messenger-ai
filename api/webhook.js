@@ -1,194 +1,168 @@
 // api/webhook.js
-// Vercel — Node runtime
-export const config = { runtime: "nodejs" };
+// Messenger ↔ OpenAI v2 Workflows bridge with echo-guard + simple session
 
-import OpenAI from "openai";
-import fetch from "node-fetch"; // Vercel Node has fetch, but keeping import for local dev
-
-// --- Env ---
-const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const META_GRAPH = 'https://graph.facebook.com/v18.0'; // v18 works fine
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_PROJECT = process.env.OPENAI_PROJECT || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT; // optional
 const WORKFLOW_ID = process.env.WORKFLOW_ID;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 
-// --- OpenAI client (SDK handles API versioning; no /v1 vs /v2 mistakes) ---
-const openai = new OpenAI({
-  apiKey: OPENAI_KEY,
-  ...(OPENAI_PROJECT ? { project: OPENAI_PROJECT } : {}),
-});
+// --- simple in-memory session (ok for now; moves to Redis later) ---
+const SESSIONS = new Map();
+const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-// --- FB send helper ---
-async function fbSendText(recipientId, text) {
-  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(
-    PAGE_TOKEN
-  )}`;
+function getSession(userId) {
+  const now = Date.now();
+  const s = SESSIONS.get(userId);
+  if (!s || (now - s.updatedAt) > SESSION_TTL_MS) {
+    const fresh = { greeted: false, fallbackGiven: false, updatedAt: now };
+    SESSIONS.set(userId, fresh);
+    return fresh;
+  }
+  s.updatedAt = now;
+  return s;
+}
 
+async function sendText(recipientId, text) {
+  const url = `${META_GRAPH}/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
   const body = {
     recipient: { id: recipientId },
-    message: { text },
-    messaging_type: "RESPONSE",
+    message: { text }
   };
-
   const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
-
-  const data = await res.text(); // keep raw for logging
-  if (!res.ok) {
-    console.error("❌ FB SEND error:", res.status, data);
-    return { ok: false, status: res.status, data };
-  }
-  console.log("✅ FB SEND:", data);
-  return { ok: true };
+  const data = await res.json().catch(() => ({}));
+  console.log('FB SEND ▶', { recipient_id: recipientId, message: text, status: res.status, resp: data });
+  return data;
 }
 
-// --- Simple intent detector (Taglish + common model names) ---
-const USED_CAR_REGEX =
-  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|crosswind|avanza|sangla|orcr|financ(?:e|ing)|loan|dp|downpayment|down\s*payment)\b/i;
+function looksLikeUsedCarIntent(t) {
+  if (!t) return false;
+  const text = t.toLowerCase();
+  return [
+    'used car','used-car','second hand','2nd hand','pre-owned','preowned',
+    'finance','financing','installment','loan','dp','downpayment','down payment',
+    'bili','buy','purchase','hanap','looking for','sedan','suv','mpv','van','pickup','hatchback',
+    'vios','mirage','innova','fortuner','civic','accent','almera'
+  ].some(k => text.includes(k));
+}
 
-// --- Welcome chat (normal LLM reply) ---
-async function getWelcomeReply(userText) {
+async function runWorkflowV2(userText) {
+  const url = `https://api.openai.com/v2/workflows/${WORKFLOW_ID}/runs`;
+  const headers = {
+    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+    ...(OPENAI_PROJECT ? {'OpenAI-Project': OPENAI_PROJECT} : {}),
+    'Content-Type': 'application/json'
+  };
+  const payload = { input: { input_as_text: userText } };
+
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  const text = await res.text();
+
+  // v2 always returns JSON; if you ever see HTML, it’s a 404/HTML error page
   try {
-    const chat = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      temperature: 0.3,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are BentaCars Concierge. Be brief, friendly, Taglish, and helpful. If the user asks about used cars/financing/sangla, invite them to share body type and city.",
-        },
-        {
-          role: "user",
-          content: userText || "Hi",
-        },
-      ],
-    });
+    const json = JSON.parse(text);
+    console.log('Workflow v2 ◀', json);
+    // Try common result shapes
+    const msg =
+      json?.output?.message ??
+      json?.result?.message ??
+      json?.output_text ??
+      json?.message ??
+      null;
 
-    const reply =
-      chat?.choices?.[0]?.message?.content?.trim() ||
-      "Hi po! Welcome to BentaCars 😊 Interested po ba kayo sa used car options or need ninyo ng tulong sa financing?";
-    return reply;
-  } catch (err) {
-    console.error("❌ OpenAI chat error:", err);
-    return "Hi! Welcome to BentaCars 😊 How can we help you today?";
+    if (typeof msg === 'string' && msg.trim()) return msg.trim();
+
+    // As a fallback, stringify something meaningful
+    return 'Thanks! Let me check that for you.';
+  } catch (e) {
+    console.error('Workflow v2 failed: raw:', text);
+    throw new Error(`Workflow v2 failed: ${text.slice(0, 200)}`);
   }
 }
 
-// --- Trigger Agent Builder Workflow (via SDK beta.workflows) ---
-async function runWorkflowV2(inputText) {
-  if (!WORKFLOW_ID) throw new Error("WORKFLOW_ID env is missing");
-
-  try {
-    // SDK abstracts the path; no manual '/v1' or '/v2' URL strings here.
-    const run = await openai.beta.workflows.runs.create({
-      workflow_id: WORKFLOW_ID,
-      input: { input_as_text: inputText },
-    });
-
-    // The output shape depends on your workflow; we’ll try common shapes:
-    // 1) Single text output
-    const out0 = run?.output?.[0];
-    const content0 = out0?.content?.[0];
-    const maybeText =
-      content0?.type === "output_text"
-        ? content0?.text
-        : content0?.type === "text"
-        ? content0?.text
-        : null;
-
-    if (typeof maybeText === "string" && maybeText.trim()) {
-      return maybeText.trim();
-    }
-
-    // 2) If your workflow returns a JSON object with { message }
-    const maybeMsg = out0?.content?.find?.((c) => c?.type === "json")?.json
-      ?.message;
-    if (typeof maybeMsg === "string" && maybeMsg.trim()) {
-      return maybeMsg.trim();
-    }
-
-    // Fallback: stringify a small slice for debugging
-    console.warn("⚠️ Unrecognized workflow output shape:", JSON.stringify(run).slice(0, 800));
-    return "Thanks! Let me check matching units for you now. 🚗";
-  } catch (err) {
-    // If the SDK still throws a URL/version issue, we capture it and don’t break the chat
-    console.error("❌ Workflow v2 failed:", err);
-    return "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏";
-  }
-}
-
-// --- Main handler ---
 export default async function handler(req, res) {
   try {
-    if (req.method === "GET") {
-      // Webhook verification handshake
-      const mode = req.query["hub.mode"];
-      const token = req.query["hub.verify_token"];
-      const challenge = req.query["hub.challenge"];
-
-      if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("✅ Webhook verify: success");
-        res.status(200).send(challenge);
-      } else {
-        console.warn("❌ Webhook verify: failed");
-        res.status(403).send("Forbidden");
+    // --- Verify webhook (GET) ---
+    if (req.method === 'GET') {
+      const mode = req.query['hub.mode'];
+      const token = req.query['hub.verify_token'];
+      const challenge = req.query['hub.challenge'];
+      if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+        console.log('Webhook verified');
+        return res.status(200).send(challenge);
       }
-      return;
+      return res.status(403).send('Verification failed');
     }
 
-    if (req.method !== "POST") {
-      res.status(405).send("Method Not Allowed");
-      return;
+    // --- Receive messages (POST) ---
+    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+    const body = req.body;
+    // Messenger delivery format
+    const entry = body?.entry?.[0];
+    const messaging = entry?.messaging?.[0];
+    console.log('Incoming ◀', JSON.stringify({ senderId: messaging?.sender?.id, text: messaging?.message?.text }, null, 2));
+
+    // Guard: if nothing useful, ACK to avoid retries
+    if (!messaging || !messaging.sender || !messaging.message) {
+      return res.status(200).send('EVENT_RECEIVED');
     }
 
-    const body = req.body || {};
-    // Facebook sometimes POSTs stringified JSON depending on config
-    const payload = typeof body === "string" ? JSON.parse(body) : body;
+    const senderId = messaging.sender.id;
 
-    // Basic structure guard
-    if (!payload?.entry?.length) {
-      console.warn("⚠️ No entries in webhook payload");
-      res.status(200).send("EVENT_RECEIVED");
-      return;
+    // 🔒 IMPORTANT: Ignore page's own echoes to stop loops
+    if (messaging.message.is_echo) {
+      console.log('Skipping echo message');
+      return res.status(200).send('OK');
     }
 
-    for (const entry of payload.entry) {
-      const messagings = entry?.messaging || [];
-      for (const m of messagings) {
-        const senderId = m?.sender?.id;
-        const text = m?.message?.text?.trim();
+    const text = (messaging.message.text || '').trim();
 
-        if (!senderId || !text) {
-          continue;
-        }
+    const session = getSession(senderId);
 
-        console.log("🟢 Incoming:", { senderId, text });
+    // First-time greeting (once per session)
+    if (!session.greeted) {
+      session.greeted = true;
+      await sendText(senderId, 'Hi po! 😊 Welcome to BentaCars. Interested po ba kayo sa used-car options or need ninyo ng tulong sa financing?');
+      return res.status(200).send('OK');
+    }
 
-        // 1) Always send a quick welcome/concierge reply first
-        const welcome = await getWelcomeReply(text);
-        await fbSendText(senderId, welcome);
-
-        // 2) If message indicates used-car intent → trigger your workflow v2
-        if (USED_CAR_REGEX.test(text)) {
-          const thinkingNote = "Salamat! Iche-check ko muna ang available options based sa gusto ninyo. ⏳";
-          await fbSendText(senderId, thinkingNote);
-
-          const wfReply = await runWorkflowV2(text);
-          await fbSendText(senderId, wfReply);
-        }
+    // Route: Used-car / financing intent → run Workflow v2
+    if (looksLikeUsedCarIntent(text)) {
+      await sendText(senderId, 'Got it! Sige, iche-check ko ang best options for you. ⏳');
+      try {
+        const reply = await runWorkflowV2(text);
+        await sendText(senderId, reply);
+      } catch (err) {
+        console.error('Workflow error ▶', err);
+        await sendText(senderId, 'Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏');
       }
+      return res.status(200).send('OK');
     }
 
-    // FB requires 200 quickly
-    res.status(200).send("EVENT_RECEIVED");
+    // Soft fallback (only once per session to avoid spam)
+    if (!session.fallbackGiven) {
+      session.fallbackGiven = true;
+      await sendText(senderId, 'Sige! Paki-sabihin kung naghahanap kayo ng used-car (hal. “sedan sa QC”) o kung financing assistance ang kailangan.');
+      return res.status(200).send('OK');
+    }
+
+    // Final neutral ACK
+    await sendText(senderId, 'Noted po. Sabihin lang ang body type (sedan/SUV/van…), city, at cash or financing para makapag-match ako.');
+    return res.status(200).send('OK');
+
   } catch (err) {
-    console.error("❌ Webhook fatal error:", err);
-    // Never fail the webhook for FB; reply 200 with a soft notice
-    res.status(200).send("EVENT_RECEIVED");
+    console.error('❌ Webhook error:', err);
+    // Always 200 to stop FB retries; send a generic message if we still can’t process
+    try {
+      const senderId = req?.body?.entry?.[0]?.messaging?.[0]?.sender?.id;
+      if (senderId) await sendText(senderId, 'Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏');
+    } catch {}
+    return res.status(200).send('OK');
   }
 }
