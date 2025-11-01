@@ -1,7 +1,5 @@
 // api/webhook.js
-// Messenger webhook -> OpenAI Workflows v2 (SDK), with echo-filter + debounce
-
-import OpenAI from "openai";
+// Messenger webhook -> OpenAI Workflows v2 via fetch (no /v1), with echo-filter + debounce
 
 const META_GRAPH_URL = "https://graph.facebook.com/v19.0";
 
@@ -9,17 +7,9 @@ const VERIFY_TOKEN       = process.env.META_VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN  = process.env.PAGE_ACCESS_TOKEN;
 
 const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
-const OPENAI_PROJECT     = process.env.OPENAI_PROJECT || "";
+const OPENAI_PROJECT     = process.env.OPENAI_PROJECT || "";   // optional
 const WORKFLOW_ID        = (process.env.WORKFLOW_ID || "").trim(); // wf_...
 
-// --- OpenAI SDK (no /v1 paths in code; we’ll set the v2 beta header) ---
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  // pass project if you use multi-project
-  ...(OPENAI_PROJECT ? { project: OPENAI_PROJECT } : {}),
-});
-
-// ---- helpers ----
 function json(res, status = 200) {
   return new Response(JSON.stringify(res), {
     status,
@@ -28,7 +18,7 @@ function json(res, status = 200) {
 }
 
 async function sendFBText(psid, text) {
-  // basic debounce (avoid double replies when FB retries quickly)
+  // simple debounce per user (4s)
   const now = Date.now();
   const map = sendFBText._map || (sendFBText._map = new Map());
   const last = map.get(psid) || 0;
@@ -43,7 +33,6 @@ async function sendFBText(psid, text) {
     messaging_type: "RESPONSE",
     message: { text },
   };
-
   const r = await fetch(`${META_GRAPH_URL}/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -62,45 +51,63 @@ function isUsedCarIntent(t) {
   return [
     "used car","used-car","buy","hanap","looking for","options",
     "financing","installment","loan","dp","downpayment","all in","all-in",
-    // common models/body types
     "sedan","suv","mpv","van","hatchback","pickup",
     "vios","mirage","fortuner","innova","terra","carnival"
   ].some(k => s.includes(k));
 }
 
-// --- Workflows v2 via SDK (no /v1 in your code) ---
+/** ---- Workflows v2 via fetch (no /v1) ---- */
 async function runWorkflowV2(inputText) {
   if (!WORKFLOW_ID || !WORKFLOW_ID.startsWith("wf_")) {
     throw new Error("WORKFLOW_ID missing/invalid");
   }
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY missing");
+  }
 
-  // The SDK supports Workflows; we also attach the v2 beta header.
-  // No URL strings shown here.
-  const run = await openai.workflows.runs.create(
-    {
-      workflow_id: WORKFLOW_ID,
-      inputs: { input_as_text: inputText },
-    },
-    {
-      headers: { "OpenAI-Beta": "workflows=v2" },
-    }
-  );
+  const url = `https://api.openai.com/workflows/${WORKFLOW_ID}/runs`; // <-- NO /v1
+  const headers = {
+    "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "OpenAI-Beta": "workflows=v2",
+  };
+  if (OPENAI_PROJECT) headers["OpenAI-Project"] = OPENAI_PROJECT;
 
-  // Try common places where a message might come back
+  const payload = { inputs: { input_as_text: inputText } };
+
+  const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+
+  // If the API returns HTML (nginx/404), throw a readable error
+  const text = await resp.text();
+  if (!resp.ok) {
+    let msg = text;
+    try {
+      const j = JSON.parse(text);
+      msg = j.error?.message || text;
+    } catch (_) { /* text was not JSON */ }
+    throw new Error(`Workflows v2 HTTP ${resp.status}: ${msg}`);
+  }
+
+  // Parse JSON body
+  let data;
+  try { data = JSON.parse(text); } catch {
+    throw new Error("Workflows v2: Response was not JSON");
+  }
+
+  // Try common locations for a usable message
   const candidates = [
-    run.output_text,
-    run.message,
-    run.response?.outputs?.[0]?.content?.[0]?.text,
-    run.outputs?.[0]?.content?.[0]?.text,
+    data.output_text,
+    data.message,
+    data.response?.outputs?.[0]?.content?.[0]?.text,
+    data.outputs?.[0]?.content?.[0]?.text,
   ];
   const msg = candidates.find(x => typeof x === "string" && x.trim())?.trim();
   return msg || "Salamat! Iche-check ko ang best options para sa inyo. ⏳";
 }
 
-// ---- router ----
+// ---- router logic ----
 async function handleMessage(psid, text, isEcho) {
   if (isEcho) {
-    // CRITICAL: ignore our own messages to stop loops
     console.log("Ignoring echo for", psid);
     return;
   }
@@ -151,7 +158,6 @@ export async function POST(request) {
   try {
     const body = await request.json();
 
-    // Messenger sometimes batches; handle first messaging item
     const entry = body.entry?.[0];
     const event = entry?.messaging?.[0];
     if (!event?.sender?.id || !event?.message) {
