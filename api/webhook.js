@@ -1,41 +1,32 @@
 // /api/webhook.js
-// Vercel Node runtime (NOT Edge). Uses native fetch in Node 18+
+// Node runtime (not Edge). Native fetch.
 
 export default async function handler(req, res) {
-  const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-  const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+  const VERIFY_TOKEN   = process.env.META_VERIFY_TOKEN;
+  const PAGE_TOKEN     = process.env.PAGE_ACCESS_TOKEN;
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
   const OPENAI_PROJECT = process.env.OPENAI_PROJECT;
-  const WORKFLOW_ID = process.env.WORKFLOW_ID;
+  const WORKFLOW_ID    = process.env.WORKFLOW_ID;
 
-  // --- Small helpers --------------------------------------------------------
-  const ok = (data) => res.status(200).json(data ?? { ok: true });
-  const bad = (code, msg) => res.status(code).json({ error: String(msg) });
+  const ok  = (d) => res.status(200).json(d ?? { ok: true });
+  const bad = (c, m) => res.status(c).json({ error: String(m) });
 
-  const sendTyping = async (recipientId) => {
+  const sendTyping = async (id) => {
     try {
-      await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
+      await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_TOKEN}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: recipientId },
-          sender_action: "typing_on",
-        }),
+        body: JSON.stringify({ recipient: { id }, sender_action: "typing_on" })
       });
-    } catch (e) {
-      console.error("Typing indicator failed:", e);
-    }
+    } catch {}
   };
 
-  const sendText = async (recipientId, text) => {
+  const sendText = async (id, text) => {
     try {
-      const r = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
+      const r = await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_TOKEN}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: recipientId },
-          message: { text },
-        }),
+        body: JSON.stringify({ recipient: { id }, message: { text } })
       });
       const j = await r.json().catch(() => ({}));
       console.log("📤 SEND RESULT:", j);
@@ -44,131 +35,153 @@ export default async function handler(req, res) {
     }
   };
 
-  const politeFail = async (recipientId) =>
-    sendText(
-      recipientId,
-      "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏"
-    );
+  const softFail = (id) =>
+    sendText(id, "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏");
 
-  // --- 1) Webhook VERIFY (GET) ----------------------------------------------
+  // ---- VERIFY (GET) ----
   if (req.method === "GET") {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("✅ Webhook verified!");
-      res.status(200).send(challenge);
-      return;
+      console.log("✅ Webhook verified");
+      return res.status(200).send(challenge);
     }
     return bad(403, "Verification failed");
   }
 
-  // --- 2) Incoming events (POST) --------------------------------------------
+  // ---- PROCESS (POST) ----
   if (req.method === "POST") {
     try {
       const body = req.body || {};
-      // Facebook Messenger delivers {object:'page', entry:[{ messaging: [...] }]}
       if (body.object !== "page" || !Array.isArray(body.entry)) {
-        // Allow local curl tests that send plain {message:"hi"} shape
-        console.log("ℹ️ Non-standard payload (likely test):", JSON.stringify(body));
+        console.log("ℹ️ Non-page payload (likely a local test):", body);
         return ok({ received: true });
       }
 
+      // Helper: run the workflow (v2 first, then v1 fallback)
+      const runWorkflow = async (inputText) => {
+        const commonHeaders = {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "OpenAI-Project": OPENAI_PROJECT
+        };
+
+        // v2 call
+        let resp = await fetch(`https://api.openai.com/v2/workflows/${WORKFLOW_ID}/runs`, {
+          method: "POST",
+          headers: commonHeaders,
+          body: JSON.stringify({ input: { input_as_text: inputText } })
+        });
+
+        let raw = await resp.text();
+        let jsonV2 = null;
+        try { jsonV2 = JSON.parse(raw); } catch {}
+
+        if (resp.ok) {
+          return { version: "v2", data: jsonV2 ?? raw };
+        }
+
+        // If invalid URL or not found, try v1
+        const invalidUrl =
+          !resp.ok &&
+          (resp.status === 404 ||
+           (jsonV2 && jsonV2.error && /invalid url/i.test(jsonV2.error.message || "")));
+
+        if (!invalidUrl) {
+          // Some other v2 error → bubble up
+          throw new Error(`OpenAI v2 error: ${raw}`);
+        }
+
+        // v1 fallback
+        resp = await fetch(`https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`, {
+          method: "POST",
+          headers: commonHeaders,
+          body: JSON.stringify({ input: { input_as_text: inputText } })
+        });
+
+        raw = await resp.text();
+        let jsonV1 = null;
+        try { jsonV1 = JSON.parse(raw); } catch {}
+
+        if (!resp.ok) throw new Error(`OpenAI v1 error: ${raw}`);
+        return { version: "v1", data: jsonV1 ?? raw };
+      };
+
+      // Helper: extract a reply string from any workflow shape
+      const extractReply = (wf) => {
+        if (!wf || typeof wf !== "object") return null;
+
+        // Common shapes from Agent Builder returns
+        // direct
+        if (typeof wf.output_text === "string") return wf.output_text;
+        if (wf.result && typeof wf.result.output_text === "string") return wf.result.output_text;
+
+        // v2 run objects may wrap output
+        if (wf.output && typeof wf.output.text === "string") return wf.output.text;
+        if (wf.output && typeof wf.output.output_text === "string") return wf.output.output_text;
+
+        // Sometimes under data/content
+        const tryDeep =
+          wf?.data?.[0]?.content?.[0]?.text?.value ||
+          wf?.choices?.[0]?.message?.content ||
+          wf?.message;
+
+        if (typeof tryDeep === "string") return tryDeep;
+
+        return null;
+      };
+
       for (const entry of body.entry) {
-        const messagingEvents = entry.messaging || [];
-        for (const event of messagingEvents) {
-          const senderId = event?.sender?.id;
+        for (const ev of entry.messaging || []) {
+          const senderId =
+            ev?.sender?.id ||
+            ev?.recipient?.user_ref || // very rare alt
+            null;
+
           const text =
-            event?.message?.text ??
-            event?.postback?.title ??
-            event?.postback?.payload ??
+            ev?.message?.text ??
+            ev?.postback?.payload ??
+            ev?.postback?.title ??
             "";
 
           if (!senderId) continue;
-
-          // Skip if nothing to process
           if (!text || typeof text !== "string") {
-            await politeFail(senderId);
+            await softFail(senderId);
             continue;
           }
 
           console.log("📥 Incoming:", { senderId, text });
-
-          // Send typing indicator
           await sendTyping(senderId);
 
-          // --- Call OpenAI Workflows (CORRECT, ABSOLUTE URL) -----------------
-          const oaResponse = await fetch(
-            `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: "application/json",
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                "OpenAI-Project": OPENAI_PROJECT,
-              },
-              body: JSON.stringify({
-                // Your workflow expects { input_as_text: "..." }
-                input: { input_as_text: text },
-                // Some workflows also accept model; harmless to include.
-                model: "gpt-4.1",
-              }),
-            }
-          );
-
-          // If OpenAI returns HTML (e.g., wrong URL), avoid JSON.parse crash
-          const raw = await oaResponse.text();
-          let wf;
+          let wfRun;
           try {
-            wf = JSON.parse(raw);
-          } catch (e) {
-            console.error("❌ Webhook error: OpenAI returned non-JSON:", raw.slice(0, 200));
-            await politeFail(senderId);
+            wfRun = await runWorkflow(text);
+          } catch (err) {
+            console.error("❌ OpenAI call failed:", err);
+            await softFail(senderId);
             continue;
           }
 
-          if (!oaResponse.ok) {
-            console.error("❌ OpenAI returned error:", wf);
-            await politeFail(senderId);
+          console.log(`🤖 Workflow (${wfRun.version}) raw:`, JSON.stringify(wfRun.data).slice(0, 600));
+
+          const reply = extractReply(wfRun.data);
+          if (!reply || typeof reply !== "string") {
+            await softFail(senderId);
             continue;
           }
 
-          // --- Extract the workflow's reply text safely ----------------------
-          // Your Agent Builder workflow returns an object shaped like either:
-          //  A) { output_text: "..." }
-          //  B) { result: { output_text: "..." } }
-          //  C) { output: { text: "..." } }
-          //  D) fallback to something inside arrays if present
-          const replyText =
-            wf?.output_text ||
-            wf?.result?.output_text ||
-            wf?.output?.text ||
-            wf?.data?.[0]?.content?.[0]?.text?.value ||
-            wf?.message ||
-            null;
-
-          console.log("🤖 Workflow output (raw):", JSON.stringify(wf).slice(0, 500));
-          console.log("📝 Resolved reply text:", replyText);
-
-          if (!replyText || typeof replyText !== "string") {
-            await politeFail(senderId);
-            continue;
-          }
-
-          // --- Send back to Messenger ---------------------------------------
-          await sendText(senderId, replyText);
+          await sendText(senderId, reply);
         }
       }
 
       return ok({ delivered: true });
-    } catch (err) {
-      console.error("❌ Unhandled webhook error:", err);
+    } catch (e) {
+      console.error("❌ Unhandled webhook error:", e);
       return bad(500, "Server error");
     }
   }
 
-  // --- Others ---------------------------------------------------------------
   return bad(404, "Not Found");
 }
