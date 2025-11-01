@@ -1,50 +1,36 @@
-// api/webhook.js
 export default async function handler(req, res) {
-  // --- ALWAYS LOG THE HIT ---
-  console.log("WEBHOOK HIT", {
+  const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
+
+  // ✅ Log every request for debugging
+  console.log("📩 Incoming request:", {
     method: req.method,
-    url: req.url,
+    body: req.body,
     query: req.query,
-    headers: {
-      "content-type": req.headers["content-type"],
-      "user-agent": req.headers["user-agent"],
-      "x-hub-signature-256": req.headers["x-hub-signature-256"] || null,
-    },
+    headers: req.headers,
   });
 
+  // ✅ Handle Meta Webhook Verification (GET)
   if (req.method === "GET") {
-    const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-    const { ["hub.mode"]: mode, ["hub.verify_token"]: token, ["hub.challenge"]: challenge } = req.query;
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
 
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("Webhook verify: success");
+      console.log("✅ WEBHOOK VERIFIED");
       return res.status(200).send(challenge);
+    } else {
+      return res.sendStatus(403);
     }
-    console.warn("Webhook verify: failed", { mode, tokenOK: !!token });
-    return res.sendStatus(403);
   }
 
+  // ✅ Handle Incoming Events (POST)
   if (req.method === "POST") {
-    try {
-      console.log("WEBHOOK BODY RAW:", JSON.stringify(req.body, null, 2));
+    console.log("✅ WEBHOOK POST RECEIVED:", JSON.stringify(req.body, null, 2));
 
-      // Basic router (optional)
-      if (req.body?.object === "page") {
-        for (const entry of req.body.entry || []) {
-          for (const ev of entry.messaging || []) {
-            if (ev.message)   console.log("MESSAGE EVENT:", JSON.stringify(ev.message, null, 2));
-            if (ev.postback)  console.log("POSTBACK EVENT:", JSON.stringify(ev.postback, null, 2));
-          }
-        }
-      }
-
-      // Always 200 to stop Meta retries
-      return res.status(200).send("EVENT_RECEIVED");
-    } catch (e) {
-      console.error("POST handler error:", e);
-      return res.status(200).send("EVENT_RECEIVED");
-    }
+    // Always reply 200 OK so Meta stops retrying
+    return res.status(200).send("EVENT_RECEIVED");
   }
 
+  // ❌ Any other request = Not Found
   return res.status(404).send("Not Found");
 }
