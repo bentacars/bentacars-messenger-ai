@@ -1,13 +1,13 @@
 export default async function handler(req, res) {
-  if (req.method === "GET") {
-    // Facebook webhook verification
-    const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
+  const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
 
+  // ✅ Handle Webhook Verification (GET)
+  if (req.method === "GET") {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-    if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
       console.log("✅ Webhook verified!");
       return res.status(200).send(challenge);
     } else {
@@ -15,10 +15,17 @@ export default async function handler(req, res) {
     }
   }
 
+  // ✅ Handle Incoming Webhook Events (POST)
   if (req.method === "POST") {
-    console.log("🔥 Incoming webhook event:", JSON.stringify(req.body, null, 2));
-    return res.status(200).send("EVENT_RECEIVED");
+    console.log("📩 Incoming webhook event:", JSON.stringify(req.body, null, 2));
+
+    // Respond immediately so Meta stops retrying
+    res.status(200).send("EVENT_RECEIVED");
+
+    // TODO: next step — forward the message to OpenAI agent or logic handler here
+
+    return;
   }
 
-  res.status(404).send("Not Found");
+  return res.status(404).send("Not Found");
 }
