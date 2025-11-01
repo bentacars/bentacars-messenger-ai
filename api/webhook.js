@@ -1,181 +1,151 @@
+// /api/webhook.js
 export default async function handler(req, res) {
-  const VERIFY_TOKEN   = process.env.META_VERIFY_TOKEN;
-  const PAGE_TOKEN     = process.env.PAGE_ACCESS_TOKEN;
-  const OPENAI_KEY     = process.env.OPENAI_API_KEY;
-  const OPENAI_PROJECT = process.env.OPENAI_PROJECT || undefined; // optional
-  const WORKFLOW_ID    = process.env.WORKFLOW_ID || "";           // Agent Builder workflow id (optional)
-  const OPENAI_BASE    = "https://api.openai.com";
+  try {
+    const VERIFY_TOKEN     = process.env.META_VERIFY_TOKEN;
+    const PAGE_ACCESS_TOKEN= process.env.PAGE_ACCESS_TOKEN;
+    const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+    const OPENAI_PROJECT   = process.env.OPENAI_PROJECT;   // Optional but recommended
+    const WORKFLOW_ID      = process.env.WORKFLOW_ID;      // wf_... from Agent Builder
 
-  // --- Helpers ---------------------------------------------------------------
-  const log = (...args) => console.log(...args);
-
-  const sendToMessenger = async (recipientId, text) => {
-    const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-    const body = {
-      recipient: { id: recipientId },
-      message: { text }
-    };
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    const jr = await r.json().catch(() => ({}));
-    log("↳ SEND RESULT:", { recipient_id: jr.recipient_id, message_id: jr.message_id });
-    return jr;
-  };
-
-  const withTimeout = (p, ms) =>
-    Promise.race([
-      p,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms))
-    ]);
-
-  // OpenAI call: prefers Agent Builder WORKFLOW (Responses API), else plain model
-  const callOpenAI = async (userText) => {
-    try {
-      if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY missing");
-
-      if (WORKFLOW_ID) {
-        // Use Responses API with a workflow input
-        const body = {
-          // IMPORTANT: the schema for workflow inputs uses "input" (string) and "workflow" object.
-          // We pass the workflow id via the new "input" envelope with metadata.
-          // If your account has the Agents SDK, you can also hit the /v1/workflows/{id}/runs endpoint.
-          input: [
-            { role: "user", content: [{ type: "input_text", text: userText }] }
-          ],
-          // Hint to the backend about the workflow we want to run:
-          metadata: { workflow_id: WORKFLOW_ID },
-          // We only need text out
-          modalities: ["text"]
-        };
-
-        const r = await withTimeout(
-          fetch(`${OPENAI_BASE}/v1/responses`, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${OPENAI_KEY}`,
-              ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(body)
-          }),
-          8000
-        );
-
-        const data = await r.json();
-        log("OpenAI workflow resp:", JSON.stringify(data).slice(0, 800));
-
-        // Extract first text output safely
-        const out = data?.output?.[0]?.content?.find?.(c => c.type === "output_text")?.text
-                 || data?.output_text
-                 || data?.response?.output_text
-                 || null;
-
-        if (!out) throw new Error("No output_text from workflow");
-        return String(out);
-      } else {
-        // Fallback: direct model (simple Chat → Responses API)
-        const r = await withTimeout(
-          fetch(`${OPENAI_BASE}/v1/responses`, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${OPENAI_KEY}`,
-              ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              model: "gpt-4.1-mini",
-              input: [
-                {
-                  role: "system",
-                  content: "You are BentaCars Consultant. Reply in short, natural Taglish. If the user asks about a specific model, acknowledge and ask 1 follow-up (body type or budget)."
-                },
-                { role: "user", content: userText }
-              ],
-              modalities: ["text"]
-            })
-          }),
-          8000
-        );
-        const data = await r.json();
-        log("OpenAI simple resp:", JSON.stringify(data).slice(0, 800));
-
-        const out = data?.output?.[0]?.content?.find?.(c => c.type === "output_text")?.text
-                 || data?.output_text
-                 || null;
-        if (!out) throw new Error("No output_text from model");
-        return String(out);
+    // --- 1) VERIFY CALLBACK (GET) ---
+    if (req.method === "GET") {
+      const mode      = req.query["hub.mode"];
+      const token     = req.query["hub.verify_token"];
+      const challenge = req.query["hub.challenge"];
+      if (mode === "subscribe" && token === VERIFY_TOKEN) {
+        console.log("Webhook verified!");
+        return res.status(200).send(challenge);
       }
-    } catch (err) {
-      log("OpenAI ERROR:", err?.message || err);
-      return null;
+      return res.status(403).send("Forbidden");
     }
-  };
 
-  // --- Webhook Verification (GET) -------------------------------------------
-  if (req.method === "GET") {
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      log("✅ Webhook verify: success");
-      return res.status(200).send(challenge);
-    }
-    log("❌ Webhook verify failed");
-    return res.sendStatus(403);
-  }
-
-  // --- Incoming Events (POST) -----------------------------------------------
-  if (req.method === "POST") {
-    try {
+    // --- 2) HANDLE EVENTS (POST) ---
+    if (req.method === "POST") {
       const body = req.body;
-      // v24 format: { object: 'page', entry: [ { messaging: [ ... ] } ] }
-      if (body?.object !== "page" || !Array.isArray(body.entry)) {
-        log("Ignoring non-page payload");
-        return res.sendStatus(200);
+      console.log("Incoming webhook event:", JSON.stringify(body, null, 2));
+
+      if (body.object !== "page" || !Array.isArray(body.entry)) {
+        return res.status(200).send("EVENT_RECEIVED"); // acknowledge even if not a page event
       }
 
-      // Process each messaging event (FB batches them)
+      // Process each messaging event
       for (const entry of body.entry) {
-        const events = entry.messaging || [];
-        for (const event of events) {
-          const senderId = event?.sender?.id;
-          const postback  = event?.postback?.payload;
-          const text      = event?.message?.text?.trim();
+        const messaging = entry.messaging || [];
+        for (const event of messaging) {
+          const senderId = event.sender?.id;
+          const pageId   = event.recipient?.id;
 
+          // Only proceed if we have a sender (a human user)
           if (!senderId) continue;
 
-          // 1) Immediate ack so user sees activity
-          const ack = "Thanks! Let me check that for you.";
-          await sendToMessenger(senderId, ack);
+          // Extract text either from a regular message or a postback
+          const isTextEvent = !!event.message?.text;
+          const isPostback  = !!event.postback?.payload;
 
-          let userText = text || postback || "";
-          log("Incoming:", { senderId, text: userText });
+          const inputText =
+            (isTextEvent && event.message.text) ||
+            (isPostback && event.postback.payload) ||
+            "";
 
-          // If nothing meaningful, continue
-          if (!userText) continue;
+          // 2a. Show typing and send a short ack immediately
+          await sendTyping(PAGE_ACCESS_TOKEN, senderId, true);
+          await sendText(PAGE_ACCESS_TOKEN, senderId, "Thanks! Let me check that for you.");
 
-          // 2) Call OpenAI (workflow if provided → else fallback model)
-          const aiReply = await callOpenAI(userText);
+          if (!inputText) {
+            await sendText(PAGE_ACCESS_TOKEN, senderId,
+              "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏");
+            continue;
+          }
 
-          // 3) Send result or graceful fallback
-          const safeReply =
-            aiReply ||
-            "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏";
+          // 2b. Call your Agent Builder WORKFLOW through Responses API
+          let aiReply = null;
+          try {
+            const resp = await fetch("https://api.openai.com/v1/responses", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${OPENAI_API_KEY}`,
+                "Content-Type": "application/json",
+                ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {})
+              },
+              body: JSON.stringify({
+                // ✅ Correct field name:
+                workflow_id: WORKFLOW_ID,
+                input: [
+                  { role: "user", content: [{ type: "input_text", text: inputText }] }
+                ]
+              })
+            });
 
-          await sendToMessenger(senderId, safeReply);
+            const json = await resp.json();
+            if (!resp.ok) {
+              console.error("OpenAI error:", JSON.stringify(json, null, 2));
+              throw new Error(json?.error?.message || "OpenAI request failed");
+            }
+
+            // Try to extract a plain text reply in a few robust ways
+            aiReply =
+              json.output_text ||
+              json.output?.[0]?.content?.map(c => c?.text).filter(Boolean).join("\n") ||
+              json.output?.[0]?.content?.[0]?.text ||
+              null;
+
+          } catch (err) {
+            console.error("OpenAI call failed:", err);
+          }
+
+          // 2c. Fall back message if we didn't get something usable
+          if (!aiReply || typeof aiReply !== "string") {
+            aiReply = "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏";
+          }
+
+          // 2d. Send the AI reply back to the user
+          console.log("REPLYING BACK:", JSON.stringify({ recipient_id: senderId, message: aiReply }));
+          await sendText(PAGE_ACCESS_TOKEN, senderId, aiReply);
+          await sendTyping(PAGE_ACCESS_TOKEN, senderId, false);
         }
       }
 
-      return res.sendStatus(200);
-    } catch (e) {
-      log("Handler ERROR:", e?.message || e);
-      return res.sendStatus(200); // Never let Meta retry-storm
+      return res.status(200).send("EVENT_RECEIVED");
     }
-  }
 
-  // --- Others ---------------------------------------------------------------
-  return res.status(404).send("Not Found");
+    return res.status(404).send("Not Found");
+  } catch (e) {
+    console.error("Webhook fatal:", e);
+    return res.status(500).send("Server error");
+  }
+}
+
+/* ---------------- Messenger helpers ---------------- */
+
+async function sendTyping(token, psid, on = true) {
+  try {
+    await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: psid },
+        sender_action: on ? "typing_on" : "typing_off"
+      })
+    });
+  } catch (e) {
+    console.error("typing error:", e);
+  }
+}
+
+async function sendText(token, psid, text) {
+  try {
+    const r = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: psid },
+        message: { text }
+      })
+    });
+    const j = await r.json();
+    if (!r.ok) console.error("sendText FAIL:", j);
+    else       console.log("SEND RESULT:", j);
+  } catch (e) {
+    console.error("sendText error:", e);
+  }
 }
