@@ -1,195 +1,169 @@
 // api/webhook.js
-// Vercel serverless function (ESM). Handles FB Messenger → OpenAI Agents Workflow v2.
 export const config = { runtime: "nodejs" };
 
 import OpenAI from "openai";
+import fetch from "node-fetch";
 
-// ---------- ENV ----------
-const PAGE_TOKEN        = process.env.PAGE_ACCESS_TOKEN;      // Facebook Page Access Token
-const VERIFY_TOKEN      = process.env.META_VERIFY_TOKEN;       // Webhook verify token
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;          // sk-proj-...
-const WORKFLOW_ID       = process.env.WORKFLOW_ID;             // wf_...
-const WORKFLOW_VERSION  = process.env.WORKFLOW_VERSION || "";  // optional: "2" to pin v2, else use production
+// --- Env ---
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const WORKFLOW_ID = process.env.WORKFLOW_ID;
 
-// ---------- GUARDS ----------
-if (!PAGE_TOKEN)   console.warn("⚠️ Missing PAGE_ACCESS_TOKEN");
-if (!VERIFY_TOKEN) console.warn("⚠️ Missing META_VERIFY_TOKEN");
-if (!OPENAI_API_KEY) console.warn("⚠️ Missing OPENAI_API_KEY");
-if (!WORKFLOW_ID)  console.warn("⚠️ Missing WORKFLOW_ID");
+// --- OpenAI client (SDK v4.78+ required) ---
+const openai = new OpenAI({
+  apiKey: OPENAI_KEY,
+  // Tell SDK we're using Workflows v2 on every call
+  defaultHeaders: { "OpenAI-Beta": "workflows=v2" }
+});
 
-// ---------- OPENAI SDK ----------
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+// --- Simple, in-memory de-dupe to stop loops ---
+const seenMessageIds = new Set();
+function alreadyHandled(messageId) {
+  if (!messageId) return false;
+  if (seenMessageIds.has(messageId)) return true;
+  seenMessageIds.add(messageId);
+  // keep set small
+  if (seenMessageIds.size > 5000) {
+    const first = seenMessageIds.values().next().value;
+    seenMessageIds.delete(first);
+  }
+  return false;
+}
 
-// ---------- HELPERS ----------
+// --- FB send helper ---
 async function fbSendText(recipientId, text) {
-  const url =
-    `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-
-  const body = {
-    recipient: { id: recipientId },
-    message: { text },
-    messaging_type: "RESPONSE",
-  };
+  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(
+    PAGE_TOKEN
+  )}`;
 
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      message: { text },
+      messaging_type: "RESPONSE"
+    })
   });
 
-  const raw = await res.text(); // keep raw for logs
-  if (!res.ok) {
-    console.error("❌ FB SEND", res.status, raw);
-    return { ok: false, status: res.status, raw };
-  }
-  console.log("✅ FB SEND:", raw);
-  return { ok: true };
+  const raw = await res.text();
+  if (!res.ok) console.error("❌ FB SEND error:", res.status, raw);
+  else console.log("✅ FB SEND:", raw);
 }
 
-// Taglish intent keywords to decide when to invoke the workflow
+// --- Intent detector ---
 const USED_CAR_REGEX =
-  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|avanza|sangla|orcr|financ(?:e|ing)|loan|dp|down\s*payment|downpayment|budget|sedan|suv|mpv|hatchback|van|pickup)\b/i;
+  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|avanza|sangla|orcr|financ(?:e|ing)|loan|dp|down\s*payment)\b/i;
 
-// quick welcome reply driven by a small chat completion
-async function getWelcomeReply(userText) {
+// --- Welcome reply (light LLM) ---
+async function welcomeReply(userText) {
   try {
-    const chat = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
       temperature: 0.3,
       messages: [
         {
           role: "system",
           content:
-            "You are BentaCars Concierge. Be brief, warm, and Taglish. If they ask about used cars/financing/sangla, invite them to share body type and city.",
+            "You are BentaCars Concierge. Be brief, friendly, Taglish. If user mentions used cars/financing/sangla, invite body type + city."
         },
-        { role: "user", content: userText || "Hi" },
-      ],
+        { role: "user", content: userText || "Hi" }
+      ]
     });
     return (
-      chat?.choices?.[0]?.message?.content?.trim() ||
-      "Hi po! 😊 Welcome to BentaCars. Interested po ba kayo sa used-car options or need ninyo ng tulong sa financing?"
+      resp?.choices?.[0]?.message?.content?.trim() ||
+      "Hi po! Welcome to BentaCars 😊 Interested po ba kayo sa used car options or need ninyo ng tulong sa financing?"
     );
   } catch (e) {
-    console.error("❌ OpenAI chat error:", e);
-    return "Hi po! 😊 Welcome to BentaCars. How can we help you today?";
+    console.error("❌ chat mini error:", e);
+    return "Hi po! Welcome to BentaCars 😊 How can we help you today?";
   }
 }
 
-// Run Agents Workflow v2 via SDK
+// --- Call Agent Builder Workflow v2 via SDK ---
 async function runWorkflowV2(inputText) {
   if (!WORKFLOW_ID) throw new Error("WORKFLOW_ID env is missing");
+  // IMPORTANT: the SDK path is openai.workflows.runs.create with the header set in client
+  const run = await openai.workflows.runs.create({
+    workflow_id: WORKFLOW_ID,
+    // omit version to hit production; or pass { version: "1" } to pin v1
+    input: { input_as_text: inputText }
+  });
 
-  try {
-    // The SDK abstracts REST details. No manual /v1 vs /v2 URLs needed.
-    const args = {
-      workflow_id: WORKFLOW_ID,
-      input: { input_as_text: inputText },
-    };
-    if (WORKFLOW_VERSION) args.version = WORKFLOW_VERSION; // e.g., "2" to pin v2
+  // Common output shapes
+  const first = run?.output?.[0]?.content?.[0];
+  if (first?.type === "output_text" && first?.text) return first.text.trim();
+  if (first?.type === "text" && first?.text) return first.text.trim();
 
-    const run = await openai.beta.workflows.runs.create(args);
+  const jsonMsg = run?.output?.[0]?.content?.find?.(c => c?.type === "json")?.json?.message;
+  if (typeof jsonMsg === "string" && jsonMsg.trim()) return jsonMsg.trim();
 
-    // Try common shapes to extract a user-facing message
-    const firstOut = run?.output?.[0];
-    const content0 = firstOut?.content?.[0];
-
-    if (content0?.type === "output_text" && content0?.text) {
-      return content0.text.trim();
-    }
-    if (content0?.type === "text" && content0?.text) {
-      return content0.text.trim();
-    }
-
-    // JSON fallback: look for { message: "..." }
-    const jsonBlock = firstOut?.content?.find?.((c) => c?.type === "json");
-    const msgFromJson = jsonBlock?.json?.message;
-    if (typeof msgFromJson === "string" && msgFromJson.trim()) {
-      return msgFromJson.trim();
-    }
-
-    console.warn("⚠️ Unrecognized workflow output shape:", JSON.stringify(run).slice(0, 800));
-    return "Thanks! Iche-check ko ang best matches para sa inyo. 🚗";
-  } catch (e) {
-    console.error("❌ Workflow v2 failed:", e);
-    return "Medyo nagka-issue sa processing. Paki-try ulit in a moment. 🙏";
-  }
+  console.warn("⚠️ Unrecognized workflow output:", JSON.stringify(run).slice(0, 800));
+  return "Thanks! Iche-check ko ang best options for you. 🚗";
 }
 
-// In-memory dedupe per invocation (prevents echo/duplicate within same request)
-const seenMessageIds = new Set();
-
-// ---------- MAIN HANDLER ----------
+// --- Main handler ---
 export default async function handler(req, res) {
   try {
-    // FB webhook verification
     if (req.method === "GET") {
+      // webhook verify
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
       if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("✅ Webhook verify success");
-        res.status(200).send(challenge);
-      } else {
-        console.warn("❌ Webhook verify failed");
-        res.status(403).send("Forbidden");
+        console.log("✅ Verified webhook");
+        return res.status(200).send(challenge);
       }
-      return;
+      console.warn("❌ Verify failed");
+      return res.status(403).send("Forbidden");
     }
 
-    if (req.method !== "POST") {
-      res.status(405).send("Method Not Allowed");
-      return;
-    }
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Facebook may POST a string; normalize to object
+    // Messenger sometimes posts as string
     const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
     if (!payload?.entry?.length) {
-      console.warn("⚠️ No entries in webhook payload");
-      res.status(200).send("EVENT_RECEIVED");
-      return;
+      console.warn("⚠️ No entries");
+      return res.status(200).send("EVENT_RECEIVED");
     }
 
     for (const entry of payload.entry) {
       const events = entry.messaging || [];
       for (const m of events) {
-        // Skip echoes (messages we sent)
-        if (m?.message?.is_echo) continue;
-
+        const msg = m.message;
         const senderId = m?.sender?.id;
-        const mid = m?.message?.mid;
-        const text = m?.message?.text?.trim();
+        const messageId = msg?.mid;
+        const text = msg?.text?.trim();
 
-        if (!senderId || !mid || !text) continue;
-        if (seenMessageIds.has(mid)) {
-          console.log("🟨 Duplicate message skipped:", mid);
-          continue;
-        }
-        seenMessageIds.add(mid);
+        // LOOP GUARDS:
+        if (msg?.is_echo) continue;               // ignore our own messages
+        if (alreadyHandled(messageId)) continue;  // de-dupe same MID
+        if (!senderId || !text) continue;
 
-        console.log("🟢 Incoming:", { senderId, text });
+        console.log("🟢 Incoming:", { senderId, messageId, text });
 
-        // 1) Send a concierge reply right away
-        const welcome = await getWelcomeReply(text);
+        // 1) concierge reply
+        const welcome = await welcomeReply(text);
         await fbSendText(senderId, welcome);
 
-        // 2) If user intent looks like used-car inquiry → run workflow
+        // 2) trigger workflow if intent
         if (USED_CAR_REGEX.test(text)) {
-          await fbSendText(
-            senderId,
-            "Sige po, iche-check ko ang available options based sa gusto ninyo. ⏳"
-          );
-          const wfReply = await runWorkflowV2(text);
-          await fbSendText(senderId, wfReply);
+          await fbSendText(senderId, "Sige po, iche-check ko ang available options based sa gusto ninyo. ⏳");
+          try {
+            const wf = await runWorkflowV2(text);
+            await fbSendText(senderId, wf);
+          } catch (e) {
+            console.error("❌ Workflow v2 failed:", e);
+            await fbSendText(senderId, "Medyo nagka-issue sa processing. Paki-try ulit in a moment. 🙏");
+          }
         }
       }
     }
 
-    // Acknowledge to FB quickly
     res.status(200).send("EVENT_RECEIVED");
-  } catch (err) {
-    console.error("❌ Webhook fatal error:", err);
-    // Never let FB retry storm; still 200
+  } catch (e) {
+    console.error("❌ Webhook fatal:", e);
     res.status(200).send("EVENT_RECEIVED");
   }
 }
