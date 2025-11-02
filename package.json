@@ -4,7 +4,8 @@
   "type": "module",
   "engines": { "node": ">=18.17" },
   "dependencies": {
-    "openai": "6.4.0",
+    "openai": "^4.83.0",
+    "@openai/agents": "^0.1.7",
     "node-fetch": "^3.3.2"
   }
 }
