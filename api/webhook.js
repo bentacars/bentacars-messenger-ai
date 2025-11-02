@@ -4,6 +4,9 @@ export const config = { runtime: "nodejs" };
 
 console.log("🔥 WEBHOOK LOADED - NEW BUILD - " + new Date().toISOString());
 
+console.log("OpenAI SDK VERSION =", OpenAI.VERSION);
+console.log("Has workflows API? =", !!(openai.workflows && openai.workflows.runs));
+
 import OpenAI from "openai";
 import fetch from "node-fetch";
 
