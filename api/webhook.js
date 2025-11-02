@@ -1,235 +1,216 @@
-// /api/webhook.js
+// api/webhook.js
+// Vercel (Node runtime)
 export const config = { runtime: "nodejs" };
 
-import fetch from "node-fetch";
+// We use only REST for Workflows v2 to avoid SDK version issues.
+// Keep this file self-contained and simple.
 
-// ---- Env ----
-const PAGE_TOKEN     = process.env.PAGE_ACCESS_TOKEN;   // Meta Page Access Token
-const VERIFY_TOKEN   = process.env.META_VERIFY_TOKEN;   // Any value you set in Meta
-const OPENAI_KEY     = process.env.OPENAI_API_KEY;      // sk-... (project key OK)
-const WORKFLOW_ID    = process.env.WORKFLOW_ID;         // wf_6903...
-const WORKFLOW_VER   = process.env.WORKFLOW_VERSION || "1"; // "1" (string)
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || "";
+const WORKFLOW_ID = process.env.WORKFLOW_ID;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 
-// ---- Simple, in-memory de-dupe to stop loops ----
-const seenMessageIds = new Set();
-function alreadyHandled(messageId) {
-  if (!messageId) return false;
-  if (seenMessageIds.has(messageId)) return true;
-  seenMessageIds.add(messageId);
-  // keep set small
-  if (seenMessageIds.size > 5000) {
-    const first = seenMessageIds.values().next().value;
-    seenMessageIds.delete(first);
-  }
-  return false;
-}
-
-// ---- FB send helper ----
+// -------- Helpers --------
 async function fbSendText(recipientId, text) {
-  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_TOKEN}`;
+  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(
+    PAGE_TOKEN
+  )}`;
+
   const body = {
-    messaging_type: "RESPONSE",
     recipient: { id: recipientId },
-    message: { text: text.slice(0, 2000) }
+    message: { text },
+    messaging_type: "RESPONSE",
   };
+
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
+
+  const data = await res.text();
   if (!res.ok) {
-    const err = await res.text().catch(() => "");
-    console.error("FB SEND ERROR:", res.status, err);
+    console.error("❌ FB SEND error:", res.status, data);
+    return { ok: false, status: res.status, data };
   }
+  console.log("✅ FB SEND:", data);
+  return { ok: true };
 }
 
-// ---- Call OpenAI Workflows REST (v2) ----
-async function runWorkflowV1(userText) {
-  // 1) Create run (note: POST /v1/workflows/runs, workflow_id in body)
-  const createRes = await fetch("https://api.openai.com/v1/workflows/runs", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_KEY}`,
-      "OpenAI-Beta": "workflows=v2",
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      workflow_id: WORKFLOW_ID,          // ← put ID here
-      input: { input_as_text: userText },
-      version: WORKFLOW_VER              // e.g. "1" (string) or omit for production
-    })
-  });
-
-  if (!createRes.ok) {
-    const t = await createRes.text().catch(() => "");
-    console.error("Create run failed:", createRes.status, t);
-    return null;
-  }
-
-  const created = await createRes.json();
-  const runId = created?.id || created?.run_id || created?.data?.id;
-  if (!runId) {
-    console.error("No run id in create response:", created);
-    return null;
-  }
-
-  // 2) Poll run status
-  const started = Date.now();
-  while (Date.now() - started < 12000) {
-    await new Promise(r => setTimeout(r, 1000));
-
-    const getRes = await fetch(`https://api.openai.com/v1/workflows/runs/${runId}`, {
-      method: "GET",
+// A very light welcome using Chat Completions (REST), so no SDK needed.
+async function getWelcomeReply(userText) {
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_KEY}`,
-        "OpenAI-Beta": "workflows=v2"
-      }
+        Authorization: `Bearer ${OPENAI_KEY}`,
+        "Content-Type": "application/json",
+        ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.3,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are BentaCars Concierge. Be brief, warm, and Taglish. If user seems interested in used cars or financing, invite them to share body type and city. Keep it conversational, not robotic.",
+          },
+          { role: "user", content: userText || "Hi" },
+        ],
+      }),
     });
 
-    if (!getRes.ok) {
-      const t = await getRes.text().catch(() => "");
-      console.error("Get run failed:", getRes.status, t);
-      continue;
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error("❌ OpenAI chat error:", res.status, txt);
+      return "Hi po! Welcome sa BentaCars 😊 How can we help today?";
     }
-    const run = await getRes.json();
-
-    if (run?.status === "completed" || run?.status === "succeeded") {
-      const candidates = [];
-      if (typeof run.output_text === "string") candidates.push(run.output_text);
-      if (Array.isArray(run.outputs_text)) candidates.push(run.outputs_text.join("\n"));
-      const dig = (o)=>{ if(!o)return; if(typeof o==="string") candidates.push(o);
-                         else if(Array.isArray(o)) o.forEach(dig);
-                         else if(typeof o==="object") Object.values(o).forEach(dig); };
-      dig(run.outputs); dig(run.final_output); dig(run.output);
-      const msg = (candidates.find(s => s && s.trim()) || "").trim();
-      return msg || "✅ Done. (No text output returned by the workflow.)";
-    }
-
-    if (run?.status === "failed" || run?.status === "errored" || run?.error) {
-      console.error("Run failed:", run);
-      return null;
-    }
+    const json = await res.json();
+    const content =
+      json?.choices?.[0]?.message?.content?.trim() ||
+      "Hi po! Welcome sa BentaCars 😊 Interested ba kayo sa used car options or financing?";
+    return content;
+  } catch (err) {
+    console.error("❌ getWelcomeReply error:", err);
+    return "Hi po! Welcome sa BentaCars 😊 How can we help today?";
   }
-
-  console.warn("Run timed out waiting for completion.");
-  return null;
 }
 
-  if (!createRes.ok) {
-    const t = await createRes.text().catch(() => "");
-    console.error("Create run failed:", createRes.status, t);
-    return null;
+// Car-intent regex
+const USED_CAR_REGEX =
+  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|avanza|xpander|hilux|ranger|navara|montero|terra|loan|financ(?:e|ing)|dp|down\s*payment)\b/i;
+
+// Call Workflows v2 (REST)
+async function runWorkflowV2(inputText) {
+  if (!WORKFLOW_ID) {
+    console.error("❌ Missing WORKFLOW_ID env.");
+    return "Nagka-issue sa setup. Paki-try ulit in a bit. 🙏";
   }
-  const created = await createRes.json();
-  const runId = created?.id || created?.run_id || created?.data?.id;
-  if (!runId) {
-    console.error("No run id in create response:", created);
-    return null;
-  }
+  try {
+    const res = await fetch("https://api.openai.com/v1/workflows/runs", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_KEY}`,
+        "Content-Type": "application/json",
+        "OpenAI-Beta": "workflows=v2", // REQUIRED to use v2
+        ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
+      },
+      body: JSON.stringify({
+        workflow_id: WORKFLOW_ID,
+        input: { input_as_text: inputText },
+        // If your AB is set to version=1 or version=2 internally, you generally
+        // don't need to pass "version" here. If you want to force, uncomment:
+        // version: "2",
+      }),
+    });
 
-  // 2) Poll for completion (up to ~12s)
-  const started = Date.now();
-  while (Date.now() - started < 12000) {
-    await new Promise(r => setTimeout(r, 1000));
-    const getRes = await fetch(
-      `https://api.openai.com/v1/workflows/runs/${runId}`,
-      {
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_KEY}`,
-          "OpenAI-Beta": "workflows=v2"
-        }
-      }
-    );
-
-    if (!getRes.ok) {
-      const t = await getRes.text().catch(() => "");
-      console.error("Get run failed:", getRes.status, t);
-      continue;
-    }
-    const run = await getRes.json();
-
-    if (run?.status === "completed" || run?.status === "succeeded") {
-      // Try multiple likely shapes to extract a message string safely
-      const candidates = [];
-
-      // Common fields we might see
-      if (typeof run.output_text === "string") candidates.push(run.output_text);
-      if (Array.isArray(run.outputs_text)) candidates.push(run.outputs_text.join("\n"));
-
-      // Generic: scan outputs/content for any text blocks
-      const digTexts = (obj) => {
-        if (!obj) return;
-        if (typeof obj === "string") candidates.push(obj);
-        if (Array.isArray(obj)) obj.forEach(digTexts);
-        else if (typeof obj === "object") Object.values(obj).forEach(digTexts);
-      };
-      digTexts(run.outputs);
-      digTexts(run.final_output);
-      digTexts(run.output);
-
-      const msg = (candidates.find(s => typeof s === "string" && s.trim().length > 0) || "").trim();
-      return msg || "✅ Done. (But no text output was returned by the workflow.)";
+    const raw = await res.text();
+    if (!res.ok) {
+      console.error("❌ Workflow v2 HTTP error:", res.status, raw);
+      return "Medyo nagka-issue sa processing. Paki-type ulit or try another wording. 🙏";
     }
 
-    if (run?.status === "failed" || run?.status === "errored" || run?.error) {
-      console.error("Run failed:", run);
-      return null;
-    }
-  }
+    const run = JSON.parse(raw);
 
-  console.warn("Run timed out waiting for completion.");
-  return null;
+    // Try the common shapes AB returns:
+    // 1) Single text in output[0].content[0].text (type could be "output_text" or "text")
+    const out0 = run?.output?.[0];
+    const c0 = out0?.content?.[0];
+    const directText =
+      c0?.type === "output_text" ? c0?.text :
+      c0?.type === "text" ? c0?.text : null;
+
+    if (typeof directText === "string" && directText.trim()) {
+      return directText.trim();
+    }
+
+    // 2) If your workflow returns a JSON object with { message: "..." }
+    const jsonPart = out0?.content?.find?.((c) => c?.type === "json")?.json;
+    if (jsonPart?.message && typeof jsonPart.message === "string") {
+      return jsonPart.message.trim();
+    }
+
+    // Fallback
+    console.warn("⚠️ Unrecognized workflow output shape (showing first 800 chars):", JSON.stringify(run).slice(0, 800));
+    return "Thanks! Iche-check ko muna ang best matches para sa inyo. 🚗";
+  } catch (err) {
+    console.error("❌ Workflow v2 failed:", err);
+    return "Medyo nagka-issue sa processing. Paki-try ulit mamaya. 🙏";
+  }
 }
 
-// ---- Webhook handler ----
+// -------- Main webhook handler --------
 export default async function handler(req, res) {
   try {
-    // Meta verify (GET)
+    // GET: Verify webhook
     if (req.method === "GET") {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
+
       if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        return res.status(200).send(challenge);
+        console.log("✅ Webhook verify OK");
+        res.status(200).send(challenge);
+      } else {
+        console.warn("❌ Webhook verify failed");
+        res.status(403).send("Forbidden");
       }
-      return res.status(403).send("Forbidden");
+      return;
     }
 
-    // Messages (POST)
-    if (req.method === "POST") {
-      const body = req.body;
-
-      const entry = body?.entry?.[0];
-      const messaging = entry?.messaging?.[0];
-      const senderId = messaging?.sender?.id;
-      const messageId = messaging?.message?.mid || messaging?.message?.message_id;
-      const text = messaging?.message?.text || "";
-
-      if (!senderId || !messageId) {
-        return res.status(200).json({ ok: true });
-      }
-
-      if (alreadyHandled(messageId)) {
-        return res.status(200).json({ ok: true, deduped: true });
-      }
-
-      console.log("Incoming:", { senderId, messageId, text });
-
-      // Call your Workflow
-      let reply = await runWorkflowV1(text);
-
-      if (!reply || !reply.trim()) {
-        reply = "Medyo nagka-issue sa processing. Pakisubukan ulit in a moment 🙏";
-      }
-
-      await fbSendText(senderId, reply);
-      return res.status(200).json({ ok: true });
+    // POST: Events
+    if (req.method !== "POST") {
+      res.status(405).send("Method Not Allowed");
+      return;
     }
 
-    res.status(405).send("Method Not Allowed");
+    const body = req.body || {};
+    const payload = typeof body === "string" ? JSON.parse(body) : body;
+
+    if (!payload?.entry?.length) {
+      console.warn("⚠️ No entries in payload");
+      res.status(200).send("EVENT_RECEIVED");
+      return;
+    }
+
+    for (const entry of payload.entry) {
+      const messagings = entry?.messaging || [];
+      for (const m of messagings) {
+        // Skip echoes (prevents loops)
+        if (m?.message?.is_echo) continue;
+
+        const senderId = m?.sender?.id;
+        const text = m?.message?.text?.trim();
+
+        if (!senderId || !text) continue;
+
+        console.log("🟢 Incoming:", { senderId, text });
+
+        // 1) Always welcome first (simple LLm)
+        const welcome = await getWelcomeReply(text);
+        await fbSendText(senderId, welcome);
+
+        // 2) If intent looks like car/financing → run workflow v2
+        if (USED_CAR_REGEX.test(text)) {
+          await fbSendText(
+            senderId,
+            "Salamat! Iche-check ko muna ang best options based sa gusto ninyo. ⏳"
+          );
+
+          const wfReply = await runWorkflowV2(text);
+          await fbSendText(senderId, wfReply);
+        }
+      }
+    }
+
+    // Always respond 200 to Meta
+    res.status(200).send("EVENT_RECEIVED");
   } catch (err) {
-    console.error("WEBHOOK ERROR:", err);
-    res.status(200).json({ ok: false });
+    console.error("❌ Webhook fatal error:", err);
+    // Still acknowledge to keep Meta happy
+    res.status(200).send("EVENT_RECEIVED");
   }
 }
