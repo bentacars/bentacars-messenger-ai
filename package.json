@@ -2,9 +2,9 @@
   "name": "bentacars-messenger-ai",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=18.17" },
   "dependencies": {
-    "openai": "^4.57.0",
+    "openai": "^4.78.0",
     "node-fetch": "^3.3.2"
   }
 }
