@@ -2,6 +2,8 @@
 // Vercel Node runtime
 export const config = { runtime: "nodejs" };
 
+console.log("🔥 WEBHOOK LOADED - NEW BUILD - " + new Date().toISOString());
+
 import OpenAI from "openai";
 import fetch from "node-fetch";
 
