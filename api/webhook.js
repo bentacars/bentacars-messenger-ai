@@ -17,6 +17,9 @@ const openai = new OpenAI({
   defaultHeaders: { "OpenAI-Beta": "workflows=v2" }
 });
 
+console.log("OpenAI SDK VERSION =", OpenAI.VERSION);
+console.log("Has workflows API? =", !!(openai.workflows && openai.workflows.runs));
+
 // --- Simple, in-memory de-dupe to stop loops ---
 const seenMessageIds = new Set();
 function alreadyHandled(messageId) {
