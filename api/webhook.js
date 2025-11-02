@@ -8,9 +8,7 @@ export const config = { runtime: "nodejs" };
 const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_PROJECT = process.env.OPENAI_PROJECT || "";
 const WORKFLOW_ID = process.env.WORKFLOW_ID;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 
 // -------- Helpers --------
 async function fbSendText(recipientId, text) {
@@ -90,7 +88,7 @@ async function runWorkflowV2(inputText) {
     return "Nagka-issue sa setup. Paki-try ulit in a bit. 🙏";
   }
   try {
-    const res = await fetch("https://api.openai.com/v1/workflows/runs", {
+    const res = await fetch("https://api.openai.com/v1/wf_6903132fe2ac8190bd0cf21dbb1420c30aa1dfd0791000f9/runs", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_KEY}`,
