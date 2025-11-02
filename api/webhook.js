@@ -1,36 +1,49 @@
 // api/webhook.js
-// Vercel Node runtime
+// Vercel — Node runtime (ESM)
 export const config = { runtime: "nodejs" };
-
-console.log("🔥 WEBHOOK LOADED - NEW BUILD - " + new Date().toISOString());
-
-console.log("OpenAI SDK VERSION =", OpenAI.VERSION);
-console.log("Has workflows API? =", !!(openai.workflows && openai.workflows.runs));
 
 import OpenAI from "openai";
 import fetch from "node-fetch";
+// read the installed SDK version (OpenAI.VERSION isn't exported)
+import pkg from "openai/package.json" assert { type: "json" };
 
-/* ----------------- ENV ----------------- */
+// ─── Env ───────────────────────────────────────────────────────────────────────
 const PAGE_TOKEN   = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-const OPENAI_KEY   = process.env.OPENAI_API_KEY;
-const WORKFLOW_ID  = process.env.WORKFLOW_ID;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-/* ---------- OpenAI client (Workflows v2) ---------- */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;   // <-- ensure this is set in Vercel
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || "";
+const WORKFLOW_ID    = process.env.WORKFLOW_ID;      // e.g. wf_6903...
+
+// ─── OpenAI client (create BEFORE any logs; add beta header for workflows v2) ─
 const openai = new OpenAI({
-  apiKey: OPENAI_KEY,
-  // Tell the SDK to use Workflows v2 for all workflow calls.
-  defaultHeaders: { "OpenAI-Beta": "workflows=v2" },
+  apiKey: OPENAI_API_KEY,
+  ...(OPENAI_PROJECT ? { project: OPENAI_PROJECT } : {}),
+  // this header activates Workflows v2 on supported SDKs
+  defaultHeaders: { "OpenAI-Beta": "workflows=v2" }
 });
 
-/* --------- simple in-memory de-dupe (stop loops) --------- */
+// Debug: confirm SDK + where workflows lives
+console.log("🔥 WEBHOOK LOADED - NEW BUILD -", new Date().toISOString());
+console.log("OpenAI SDK VERSION =", pkg.version);
+console.log(
+  "Has workflows API? =",
+  !!(openai.workflows?.runs || openai.beta?.workflows?.runs)
+);
+
+// pick the correct client (stable vs beta) at runtime
+function getWorkflowClient() {
+  if (openai.workflows?.runs?.create) return openai.workflows;
+  if (openai.beta?.workflows?.runs?.create) return openai.beta.workflows;
+  throw new Error("OpenAI SDK does not expose workflows.runs on this version");
+}
+
+// ─── Simple, in-memory de-dupe to stop loops ──────────────────────────────────
 const seenMessageIds = new Set();
 function alreadyHandled(messageId) {
   if (!messageId) return false;
   if (seenMessageIds.has(messageId)) return true;
   seenMessageIds.add(messageId);
-  // keep set small
   if (seenMessageIds.size > 5000) {
     const first = seenMessageIds.values().next().value;
     seenMessageIds.delete(first);
@@ -38,11 +51,12 @@ function alreadyHandled(messageId) {
   return false;
 }
 
-/* ---------------- FB send helper ---------------- */
+// ─── FB send helper ───────────────────────────────────────────────────────────
 async function fbSendText(recipientId, text) {
   const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(
     PAGE_TOKEN
   )}`;
+
   const body = {
     recipient: { id: recipientId },
     message: { text },
@@ -64,15 +78,15 @@ async function fbSendText(recipientId, text) {
   return { ok: true };
 }
 
-/* ---------- Tiny intent detector (to decide when to run the workflow) ---------- */
+// ─── Lightweight intent detector (Taglish + keywords) ─────────────────────────
 const USED_CAR_REGEX =
-  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|avanza|pickup|mpv|van|suv|sedan|sangla|orcr|financ(?:e|ing)|loan|dp|down\s*payment)\b/i;
+  /\b(buy|looking|hanap|bili|kuha|used\s*car|second[-\s]?hand|preowned|mirage|vios|fortuner|innova|civic|city|crosswind|avanza|sangla|orcr|financ(?:e|ing)|loan|dp|downpayment|down\s*payment)\b/i;
 
-/* ----------------- Concierge welcome (LLM chat) ----------------- */
+// ─── Welcome chat reply (plain LLM) ───────────────────────────────────────────
 async function getWelcomeReply(userText) {
   try {
     const chat = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
       temperature: 0.3,
       messages: [
         {
@@ -84,76 +98,75 @@ async function getWelcomeReply(userText) {
       ],
     });
 
-    return (
+    const reply =
       chat?.choices?.[0]?.message?.content?.trim() ||
-      "Hi! Kamusta? Paano kita matutulungan today—used cars, financing, o sangla?"
-    );
+      "Hi po! Welcome to BentaCars 😊 Interested po ba kayo sa used car options or need ninyo ng tulong sa financing?";
+    return reply;
   } catch (err) {
     console.error("❌ OpenAI chat error:", err);
-    return "Hi! Kamusta? Paano kita matutulungan today—used cars, financing, o sangla?";
+    return "Hi! Welcome to BentaCars 😊 How can we help you today?";
   }
 }
 
-/* --------------- Call the Agent Builder workflow (v2) --------------- */
+// ─── Run Workflows v2 safely via SDK ──────────────────────────────────────────
 async function runWorkflowV2(inputText) {
-  if (!WORKFLOW_ID) {
-    console.error("❌ WORKFLOW_ID env is missing");
-    return "Medyo nagka-issue sa config namin. Paki-try ulit in a moment. 🙏";
-  }
+  if (!WORKFLOW_ID) throw new Error("WORKFLOW_ID env is missing");
 
+  const wf = getWorkflowClient(); // throws if SDK too old
   try {
-    // Guard: make sure the SDK actually has workflows (prevents “runs of undefined”)
-    if (!openai.workflows || !openai.workflows.runs) {
-      console.error("❌ SDK doesn't expose workflows.runs — check openai package version.");
-      return "Medyo nagka-issue sa processing. Paki-try ulit in a moment. 🙏";
-    }
-
-    // Create a run on your Workflow (production by default)
-    const run = await openai.workflows.runs.create({
+    // prefer pinned version via param; omit to use production
+    const run = await wf.runs.create({
       workflow_id: WORKFLOW_ID,
       input: { input_as_text: inputText },
-      // You can send a specific version string if you want (e.g., "1" or "2"),
-      // but if you're on production, omitting it will use the current production snapshot.
-      // version: "2",
+      // version: "1", // uncomment to force v1 workflow; else current production
     });
 
-    // Try common output shapes from Agent Builder
+    // Try to read common output shapes
     const out0 = run?.output?.[0];
-    const c0 = out0?.content?.[0];
+    const content0 = out0?.content?.[0];
 
-    // 1) output_text / text
-    const text =
-      (c0?.type === "output_text" && c0?.text) ||
-      (c0?.type === "text" && c0?.text) ||
-      null;
-    if (typeof text === "string" && text.trim()) return text.trim();
+    const maybeText =
+      content0?.type === "output_text"
+        ? content0?.text
+        : content0?.type === "text"
+        ? content0?.text
+        : null;
 
-    // 2) JSON payload with message
-    const maybeMsg = out0?.content?.find?.((c) => c?.type === "json")?.json?.message;
-    if (typeof maybeMsg === "string" && maybeMsg.trim()) return maybeMsg.trim();
+    if (typeof maybeText === "string" && maybeText.trim()) {
+      return maybeText.trim();
+    }
 
-    console.warn("⚠️ Unrecognized workflow output shape:", JSON.stringify(run).slice(0, 800));
-    return "Salamat! Iche-check ko ang best options para sa’yo ngayon. 🚗";
+    const maybeMsg = out0?.content?.find?.((c) => c?.type === "json")?.json
+      ?.message;
+    if (typeof maybeMsg === "string" && maybeMsg.trim()) {
+      return maybeMsg.trim();
+    }
+
+    console.warn(
+      "⚠️ Unrecognized workflow output shape:",
+      JSON.stringify(run).slice(0, 800)
+    );
+    return "Thanks! Let me check matching units for you now. 🚗";
   } catch (err) {
-    // If anything fails we NEVER throw — we return a soft message to avoid messenger errors
-    console.error("❌ Workflow v2 call failed:", err);
-    return "Medyo nagka-issue sa processing. Paki-try ulit in a moment. 🙏";
+    console.error("❌ Workflow v2 failed:", err);
+    return "Medyo nagka-issue sa processing. Paki-try ulit or rephrase ng kaunti. 🙏";
   }
 }
 
-/* ------------------------------ Main handler ------------------------------ */
+// ─── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") {
-      // Facebook webhook verification
+      // Webhook verification handshake
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
+
       if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("✅ Webhook verify OK");
+        console.log("✅ Webhook verify: success");
         res.status(200).send(challenge);
       } else {
-        console.warn("❌ Webhook verify failed");
+        console.warn("❌ Webhook verify: failed");
         res.status(403).send("Forbidden");
       }
       return;
@@ -164,10 +177,11 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Facebook may POST stringified JSON depending on settings
-    const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const body = req.body || {};
+    const payload = typeof body === "string" ? JSON.parse(body) : body;
 
     if (!payload?.entry?.length) {
+      console.warn("⚠️ No entries in webhook payload");
       res.status(200).send("EVENT_RECEIVED");
       return;
     }
@@ -175,42 +189,36 @@ export default async function handler(req, res) {
     for (const entry of payload.entry) {
       const messagings = entry?.messaging || [];
       for (const m of messagings) {
-        // Skip echoes (messages sent by our page)
-        if (m?.message?.is_echo) continue;
-
         const senderId = m?.sender?.id;
         const text = m?.message?.text?.trim();
-        const mid = m?.message?.mid;
+        const messageId = m?.message?.mid;
 
         if (!senderId || !text) continue;
-        if (alreadyHandled(mid)) {
-          console.log("🟡 Duplicate message ignored:", mid);
-          continue;
-        }
+        if (alreadyHandled(messageId)) continue;
 
-        console.log("🟢 Incoming:", { senderId, messageId: mid, text });
+        console.log("🟢 Incoming:", { senderId, messageId, text });
 
-        // First reply: short concierge
+        // 1) quick welcome/concierge reply
         const welcome = await getWelcomeReply(text);
         await fbSendText(senderId, welcome);
 
-        // If intent looks like used-car flow, call your Workflow v2
+        // 2) trigger workflow for relevant intents
         if (USED_CAR_REGEX.test(text)) {
           await fbSendText(
             senderId,
             "Sige po, iche-check ko ang available options based sa gusto ninyo. ⏳"
           );
+
           const wfReply = await runWorkflowV2(text);
           await fbSendText(senderId, wfReply);
         }
       }
     }
 
-    // FB requires 200 quickly even if we hit errors
     res.status(200).send("EVENT_RECEIVED");
   } catch (err) {
     console.error("❌ Webhook fatal error:", err);
-    // Never fail for Messenger
+    // Always 200 for FB to stop retries
     res.status(200).send("EVENT_RECEIVED");
   }
 }
