@@ -45,22 +45,75 @@ async function fbSendText(recipientId, text) {
 
 // ---- Call OpenAI Workflows REST (v2) ----
 async function runWorkflowV1(userText) {
-  // 1) Create run
-  const createRes = await fetch(
-    `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
-    {
-      method: "POST",
+  // 1) Create run (note: POST /v1/workflows/runs, workflow_id in body)
+  const createRes = await fetch("https://api.openai.com/v1/workflows/runs", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_KEY}`,
+      "OpenAI-Beta": "workflows=v2",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      workflow_id: WORKFLOW_ID,          // ← put ID here
+      input: { input_as_text: userText },
+      version: WORKFLOW_VER              // e.g. "1" (string) or omit for production
+    })
+  });
+
+  if (!createRes.ok) {
+    const t = await createRes.text().catch(() => "");
+    console.error("Create run failed:", createRes.status, t);
+    return null;
+  }
+
+  const created = await createRes.json();
+  const runId = created?.id || created?.run_id || created?.data?.id;
+  if (!runId) {
+    console.error("No run id in create response:", created);
+    return null;
+  }
+
+  // 2) Poll run status
+  const started = Date.now();
+  while (Date.now() - started < 12000) {
+    await new Promise(r => setTimeout(r, 1000));
+
+    const getRes = await fetch(`https://api.openai.com/v1/workflows/runs/${runId}`, {
+      method: "GET",
       headers: {
         "Authorization": `Bearer ${OPENAI_KEY}`,
-        "OpenAI-Beta": "workflows=v2",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        input: { input_as_text: userText },
-        version: WORKFLOW_VER   // must be a string like "1"
-      })
+        "OpenAI-Beta": "workflows=v2"
+      }
+    });
+
+    if (!getRes.ok) {
+      const t = await getRes.text().catch(() => "");
+      console.error("Get run failed:", getRes.status, t);
+      continue;
     }
-  );
+    const run = await getRes.json();
+
+    if (run?.status === "completed" || run?.status === "succeeded") {
+      const candidates = [];
+      if (typeof run.output_text === "string") candidates.push(run.output_text);
+      if (Array.isArray(run.outputs_text)) candidates.push(run.outputs_text.join("\n"));
+      const dig = (o)=>{ if(!o)return; if(typeof o==="string") candidates.push(o);
+                         else if(Array.isArray(o)) o.forEach(dig);
+                         else if(typeof o==="object") Object.values(o).forEach(dig); };
+      dig(run.outputs); dig(run.final_output); dig(run.output);
+      const msg = (candidates.find(s => s && s.trim()) || "").trim();
+      return msg || "✅ Done. (No text output returned by the workflow.)";
+    }
+
+    if (run?.status === "failed" || run?.status === "errored" || run?.error) {
+      console.error("Run failed:", run);
+      return null;
+    }
+  }
+
+  console.warn("Run timed out waiting for completion.");
+  return null;
+}
 
   if (!createRes.ok) {
     const t = await createRes.text().catch(() => "");
