@@ -1,231 +1,182 @@
-// api/webhook.js
+// /api/webhook.js
 export const config = { runtime: "nodejs" };
 
-/**
- * Minimal dependencies (pure fetch) to avoid SDK version issues.
- * This file:
- *  - Verifies Meta webhook (GET)
- *  - Receives Messenger messages (POST)
- *  - Calls OpenAI Workflows v2 over REST
- *  - Sends one final reply (no double messages / no loop)
- */
+import fetch from "node-fetch";
 
-const PAGE_TOKEN      = process.env.PAGE_ACCESS_TOKEN;
-const VERIFY_TOKEN    = process.env.META_VERIFY_TOKEN;
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
-const WORKFLOW_ID     = process.env.WORKFLOW_ID;
-const OPENAI_PROJECT  = process.env.OPENAI_PROJECT || "";   // optional
-const WORKFLOW_VERSION= process.env.WORKFLOW_VERSION || ""; // optional, e.g. "1"
+// ---- Env ----
+const PAGE_TOKEN     = process.env.PAGE_ACCESS_TOKEN;   // Meta Page Access Token
+const VERIFY_TOKEN   = process.env.META_VERIFY_TOKEN;   // Any value you set in Meta
+const OPENAI_KEY     = process.env.OPENAI_API_KEY;      // sk-... (project key OK)
+const WORKFLOW_ID    = process.env.WORKFLOW_ID;         // wf_6903...
+const WORKFLOW_VER   = process.env.WORKFLOW_VERSION || "1"; // "1" (string)
 
-// ---------- Helpers: Facebook ----------
-async function fbTyping(recipientId, on = true) {
-  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-  const body = {
-    recipient: { id: recipientId },
-    sender_action: on ? "typing_on" : "typing_off",
-  };
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json"},
-      body: JSON.stringify(body),
-    });
-  } catch (_) {}
+// ---- Simple, in-memory de-dupe to stop loops ----
+const seenMessageIds = new Set();
+function alreadyHandled(messageId) {
+  if (!messageId) return false;
+  if (seenMessageIds.has(messageId)) return true;
+  seenMessageIds.add(messageId);
+  // keep set small
+  if (seenMessageIds.size > 5000) {
+    const first = seenMessageIds.values().next().value;
+    seenMessageIds.delete(first);
+  }
+  return false;
 }
 
+// ---- FB send helper ----
 async function fbSendText(recipientId, text) {
-  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+  const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_TOKEN}`;
   const body = {
-    recipient: { id: recipientId },
-    message: { text },
     messaging_type: "RESPONSE",
+    recipient: { id: recipientId },
+    message: { text: text.slice(0, 2000) }
   };
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json"},
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
-  const raw = await res.text();
   if (!res.ok) {
-    console.error("❌ FB SEND error:", res.status, raw);
-    return { ok: false, status: res.status, raw };
+    const err = await res.text().catch(() => "");
+    console.error("FB SEND ERROR:", res.status, err);
   }
-  console.log("✅ FB SEND:", raw);
-  return { ok: true };
 }
 
-// ---------- Helpers: OpenAI Workflows v2 REST ----------
-function openAIHeaders() {
-  const h = {
-    "Authorization": `Bearer ${OPENAI_API_KEY}`,
-    "OpenAI-Beta": "workflows=v2",
-    "Content-Type": "application/json"
-  };
-  if (OPENAI_PROJECT) h["OpenAI-Project"] = OPENAI_PROJECT;
-  return h;
-}
+// ---- Call OpenAI Workflows REST (v2) ----
+async function runWorkflowV1(userText) {
+  // 1) Create run
+  const createRes = await fetch(
+    `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_KEY}`,
+        "OpenAI-Beta": "workflows=v2",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        input: { input_as_text: userText },
+        version: WORKFLOW_VER   // must be a string like "1"
+      })
+    }
+  );
 
-async function startWorkflowRun(userText) {
-  const url = `https://api.openai.com/v1/workflows/${encodeURIComponent(WORKFLOW_ID)}/runs`;
-  const payload = {
-    input: { input_as_text: userText || "" }
-  };
-  if (WORKFLOW_VERSION) payload.version = WORKFLOW_VERSION;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: openAIHeaders(),
-    body: JSON.stringify(payload)
-  });
-  const raw = await res.text();
-  if (!res.ok) {
-    console.error("❌ OpenAI start run error:", res.status, raw);
-    throw new Error(`OpenAI start run failed: ${res.status} ${raw}`);
+  if (!createRes.ok) {
+    const t = await createRes.text().catch(() => "");
+    console.error("Create run failed:", createRes.status, t);
+    return null;
   }
-  let data;
-  try { data = JSON.parse(raw); } catch (e) {
-    throw new Error(`OpenAI start run JSON parse error: ${raw}`);
-  }
-  const runId = data?.id || data?.run_id || data?.data?.id;
+  const created = await createRes.json();
+  const runId = created?.id || created?.run_id || created?.data?.id;
   if (!runId) {
-    console.warn("⚠️ Unexpected start run response shape:", data);
-    throw new Error("No run id returned by OpenAI Workflows API");
+    console.error("No run id in create response:", created);
+    return null;
   }
-  return runId;
-}
 
-async function getWorkflowRun(runId) {
-  const url = `https://api.openai.com/v1/workflows/runs/${encodeURIComponent(runId)}`;
-  const res = await fetch(url, { headers: openAIHeaders() });
-  const raw = await res.text();
-  if (!res.ok) {
-    console.error("❌ OpenAI get run error:", res.status, raw);
-    throw new Error(`OpenAI get run failed: ${res.status} ${raw}`);
-  }
-  let data;
-  try { data = JSON.parse(raw); } catch (e) {
-    throw new Error(`OpenAI get run JSON parse error: ${raw}`);
-  }
-  return data;
-}
-
-function extractFinalTextFromRun(runJson) {
-  // Try common shapes from Workflows v2 runs
-  // 1) outputs[0].content[0].text   (text)
-  try {
-    const c0 = runJson?.output?.[0]?.content?.[0];
-    if (c0?.type === "text" && typeof c0?.text === "string") return c0.text.trim();
-    if (c0?.type === "output_text" && typeof c0?.text === "string") return c0.text.trim();
-  } catch (_) {}
-
-  // 2) outputs[0].content[*].json.message  (json content with message)
-  try {
-    const arr = runJson?.output?.[0]?.content || [];
-    for (const item of arr) {
-      if (item?.type === "json" && item?.json?.message && typeof item.json.message === "string") {
-        return item.json.message.trim();
+  // 2) Poll for completion (up to ~12s)
+  const started = Date.now();
+  while (Date.now() - started < 12000) {
+    await new Promise(r => setTimeout(r, 1000));
+    const getRes = await fetch(
+      `https://api.openai.com/v1/workflows/runs/${runId}`,
+      {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${OPENAI_KEY}`,
+          "OpenAI-Beta": "workflows=v2"
+        }
       }
+    );
+
+    if (!getRes.ok) {
+      const t = await getRes.text().catch(() => "");
+      console.error("Get run failed:", getRes.status, t);
+      continue;
     }
-  } catch (_) {}
+    const run = await getRes.json();
 
-  // 3) Some workflows put a top-level message
-  try {
-    const msg = runJson?.message || runJson?.output?.message;
-    if (typeof msg === "string" && msg.trim()) return msg.trim();
-  } catch (_) {}
+    if (run?.status === "completed" || run?.status === "succeeded") {
+      // Try multiple likely shapes to extract a message string safely
+      const candidates = [];
 
-  // 4) Give up—return a short fallback plus small snippet for debug
-  return "Salamat! Iche-check ko ang best match para sa inyo. 🚗";
-}
+      // Common fields we might see
+      if (typeof run.output_text === "string") candidates.push(run.output_text);
+      if (Array.isArray(run.outputs_text)) candidates.push(run.outputs_text.join("\n"));
 
-async function runWorkflowToMessage(userText, opts = { maxPollMs: 15000, intervalMs: 1200 }) {
-  const runId = await startWorkflowRun(userText);
+      // Generic: scan outputs/content for any text blocks
+      const digTexts = (obj) => {
+        if (!obj) return;
+        if (typeof obj === "string") candidates.push(obj);
+        if (Array.isArray(obj)) obj.forEach(digTexts);
+        else if (typeof obj === "object") Object.values(obj).forEach(digTexts);
+      };
+      digTexts(run.outputs);
+      digTexts(run.final_output);
+      digTexts(run.output);
 
-  const t0 = Date.now();
-  while (Date.now() - t0 < opts.maxPollMs) {
-    const run = await getWorkflowRun(runId);
-    const status = run?.status || run?.state || "";
-    console.log("ℹ️ Workflow status:", status);
-
-    if (status === "completed" || status === "succeeded" || status === "ok") {
-      return extractFinalTextFromRun(run);
+      const msg = (candidates.find(s => typeof s === "string" && s.trim().length > 0) || "").trim();
+      return msg || "✅ Done. (But no text output was returned by the workflow.)";
     }
-    if (status === "failed" || status === "error" || status === "cancelled") {
-      console.error("❌ Workflow failed:", JSON.stringify(run).slice(0, 800));
-      return "Medyo may issue sa processing. Try ulit po in a moment. 🙏";
+
+    if (run?.status === "failed" || run?.status === "errored" || run?.error) {
+      console.error("Run failed:", run);
+      return null;
     }
-    await new Promise(r => setTimeout(r, opts.intervalMs));
   }
-  console.warn("⏱️ Workflow poll timeout");
-  return "Thanks! Medyo mabagal ang processing ngayon—balikan ko kayo shortly. 🙏";
+
+  console.warn("Run timed out waiting for completion.");
+  return null;
 }
 
-// ---------- Main HTTP handler ----------
+// ---- Webhook handler ----
 export default async function handler(req, res) {
   try {
-    // --- Meta verify handshake ---
+    // Meta verify (GET)
     if (req.method === "GET") {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
       if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("✅ Webhook verify OK");
-        res.status(200).send(challenge);
-      } else {
-        console.warn("❌ Webhook verify failed");
-        res.status(403).send("Forbidden");
+        return res.status(200).send(challenge);
       }
-      return;
+      return res.status(403).send("Forbidden");
     }
 
-    if (req.method !== "POST") {
-      res.status(405).send("Method Not Allowed");
-      return;
-    }
+    // Messages (POST)
+    if (req.method === "POST") {
+      const body = req.body;
 
-    if (!PAGE_TOKEN || !VERIFY_TOKEN || !OPENAI_API_KEY || !WORKFLOW_ID) {
-      console.error("❌ Missing env vars. Required: PAGE_ACCESS_TOKEN, META_VERIFY_TOKEN, OPENAI_API_KEY, WORKFLOW_ID");
-      res.status(200).send("EVENT_RECEIVED");
-      return;
-    }
+      const entry = body?.entry?.[0];
+      const messaging = entry?.messaging?.[0];
+      const senderId = messaging?.sender?.id;
+      const messageId = messaging?.message?.mid || messaging?.message?.message_id;
+      const text = messaging?.message?.text || "";
 
-    const raw = req.body || {};
-    const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
-
-    if (!payload?.entry?.length) {
-      console.warn("⚠️ No entry in payload");
-      res.status(200).send("EVENT_RECEIVED");
-      return;
-    }
-
-    for (const entry of payload.entry) {
-      const messagings = entry?.messaging || [];
-      for (const m of messagings) {
-        const senderId = m?.sender?.id;
-        const text = m?.message?.text?.trim();
-
-        if (!senderId || !text) continue;
-
-        console.log("🟢 Incoming:", { senderId, text });
-
-        // One clear flow: typing → workflow → final reply (no extra welcome to avoid double messages)
-        await fbTyping(senderId, true);
-        let reply;
-        try {
-          reply = await runWorkflowToMessage(text);
-        } catch (err) {
-          console.error("❌ Workflow v2 call failed:", err);
-          reply = "Nagka-issue sa processing. Paki-try ulit po. 🙏";
-        }
-        await fbSendText(senderId, reply);
-        await fbTyping(senderId, false);
+      if (!senderId || !messageId) {
+        return res.status(200).json({ ok: true });
       }
+
+      if (alreadyHandled(messageId)) {
+        return res.status(200).json({ ok: true, deduped: true });
+      }
+
+      console.log("Incoming:", { senderId, messageId, text });
+
+      // Call your Workflow
+      let reply = await runWorkflowV1(text);
+
+      if (!reply || !reply.trim()) {
+        reply = "Medyo nagka-issue sa processing. Pakisubukan ulit in a moment 🙏";
+      }
+
+      await fbSendText(senderId, reply);
+      return res.status(200).json({ ok: true });
     }
 
-    res.status(200).send("EVENT_RECEIVED");
+    res.status(405).send("Method Not Allowed");
   } catch (err) {
-    console.error("❌ Webhook fatal:", err);
-    // Always 200 for Facebook so it doesn't keep retrying
-    res.status(200).send("EVENT_RECEIVED");
+    console.error("WEBHOOK ERROR:", err);
+    res.status(200).json({ ok: false });
   }
 }
