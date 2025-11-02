@@ -226,3 +226,7 @@ export async function runAgents(inputText) {
 
   return { text: show2.finalOutput ?? state.match_message };
 }
+export async function runAgents(inputText) {
+  // run qualifier + match, return final reply
+  return { text: "sample reply for now" };
+}
